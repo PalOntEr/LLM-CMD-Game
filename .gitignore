@@ -49,3 +49,6 @@ desktop.ini
 # Backup and temp files
 *.bak
 *.tmp
+
+# Audio files
+*.wav
