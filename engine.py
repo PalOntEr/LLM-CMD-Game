@@ -482,3 +482,212 @@ class Engine:
                 f"(failed: {m.compact_failures}, last took {m.last_compact_s:.1f}s)")
 
 
+# ---------------------------------------------------------------- terminal UI
+def enable_ansi() -> bool:
+    """True if stdout understands ANSI escape codes (switching them on for Windows consoles)."""
+    if not sys.stdout.isatty():
+        return False
+    if os.name != "nt":
+        return True
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
+        mode = ctypes.c_uint32()
+        if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            return False
+        return bool(mode.value & 0x4 or kernel32.SetConsoleMode(handle, mode.value | 0x4))  # VT processing
+    except (AttributeError, OSError):
+        return False
+
+
+def text_rows(text: str) -> int:
+    """How many terminal rows `text` takes once long lines wrap."""
+    cols = shutil.get_terminal_size().columns
+    return sum(max(1, -(-len(line) // cols)) for line in text.split("\n"))
+
+
+class Stage:
+    """The terminal screen. A background thread keeps the character's art animating in place, above the input
+    line, even while the player is typing.
+
+    The art is redrawn with ANSI cursor moves, so every row printed below it must go through print()/ask():
+    the stage counts them to know where the art has scrolled to."""
+
+    def __init__(self, game: Game, animate=True, fps=12):
+        self.game, self.fps = game, fps
+        self.animator = Animator(game.animations, game.moods[0])
+        self.live = animate and enable_ansi()
+        self.lock = threading.RLock()
+        self.rows = 0  # rows printed since the screen was cleared, i.e. the cursor's row
+        self.art_top = None  # row where the art starts; None while no art is on screen
+        self.drawn = []  # art lines as they are on screen right now
+        self.stopped = threading.Event()
+        if self.live:
+            threading.Thread(target=self._run, daemon=True).start()
+
+    def print(self, text=""):
+        with self.lock:
+            print(text, flush=True)
+            self.rows += text_rows(text)
+
+    def ask(self, prompt: str) -> str:
+        text = input(prompt)  # without the lock, so the art keeps moving while the player types
+        with self.lock:
+            self.rows += text_rows(prompt + text)
+        return text
+
+    def clear(self):
+        with self.lock:
+            if self.live:
+                sys.stdout.write("\x1b[2J\x1b[3J\x1b[H")
+                sys.stdout.flush()
+            else:
+                os.system("cls" if os.name == "nt" else "clear")
+            self.rows, self.art_top, self.drawn = 0, None, []
+
+    def show(self, turn: Turn = None, banner=""):
+        """Redraw the whole screen for a reply (or, with no turn, for the wait before the first one)."""
+        game = self.game
+        with self.lock:
+            if turn:
+                self.animator.set_thinking(False)
+                self.animator.set_mood(turn.mood)
+            idx = turn.story_idx if turn else 0
+            self.clear()
+            self.print(f"=== {game.title.upper()} ===   Story point {idx + 1}/{len(game.story)}: "
+                       f"{game.story[idx].name}")
+            frame = self.animator.frame() if self.live else game.art(self.animator.mood)
+            self.art_top, self.drawn = self.rows, frame.split("\n")
+            self.print(frame)
+            self.print()
+            if turn:
+                self.print(textwrap.fill(f"{game.character} ({turn.mood}): \"{turn.speak}\"", width=78))
+                if banner:
+                    self.print(f"\n  *** {banner} ***")
+                self.print(f"\n  {turn.footer}\n")
+
+    @contextmanager
+    def thinking(self, label: str):
+        """Play the thinking animation and a spinner while the model works. The next show() ends the
+        thinking animation together with the mood change, so the old mood's idle never flashes in between."""
+        with self.lock:
+            self.animator.set_thinking(True)
+        stop = threading.Event()
+
+        def spin():
+            frames, i = "|/-\\", 0
+            while not stop.wait(0.15):
+                with self.lock:
+                    sys.stdout.write(f"\r  {label} {frames[i % 4]}")
+                    sys.stdout.flush()
+                i += 1
+            with self.lock:
+                sys.stdout.write("\r" + " " * (len(label) + 4) + "\r")
+                sys.stdout.flush()
+
+        th = threading.Thread(target=spin, daemon=True)
+        if sys.stdout.isatty():
+            th.start()
+        try:
+            yield
+        finally:
+            stop.set()
+            if th.is_alive():
+                th.join()
+
+    def close(self):
+        """Stop animating; the art stays on screen as it is."""
+        self.stopped.set()
+        with self.lock:
+            self.art_top = None
+
+    def _run(self):
+        while not self.stopped.wait(1 / self.fps):
+            with self.lock:
+                self._draw()
+
+    def _draw(self):
+        if self.art_top is None:
+            return
+        size = shutil.get_terminal_size()
+        lines = self.animator.frame().split("\n")[:len(self.drawn)]
+        lines += [""] * (len(self.drawn) - len(lines))
+        if max(map(len, lines)) > size.columns:  # wrapped lines would wreck the layout
+            return
+        scroll = max(0, self.rows - size.lines + 1)  # rows the screen has scrolled up since it was cleared
+        out = []
+        for i, line in enumerate(lines):
+            row = self.art_top + i - scroll
+            if line != self.drawn[i] and row >= 0:
+                out.append(f"\x1b[{row + 1};1H{line.ljust(len(self.drawn[i]))}")  # pad to erase leftovers
+                self.drawn[i] = line
+        if out:
+            # save cursor + hide it, draw, restore + show: whatever the player is typing stays put
+            sys.stdout.write("\x1b7\x1b[?25l" + "".join(out) + "\x1b8\x1b[?25h")
+            sys.stdout.flush()
+
+
+def play_terminal(game: Game, host: str, model: str, animate=True) -> bool:
+    """Run one playthrough. Returns True if the player asked to restart."""
+    engine = Engine(game, host, model)
+    stage = Stage(game, animate)
+    label = f"{game.character} ponders"
+    try:
+        stage.show()
+        with stage.thinking(label):
+            turn = engine.start()
+        stage.show(turn)
+
+        while True:
+            try:
+                text = stage.ask("You > ").strip()
+            except (EOFError, KeyboardInterrupt):
+                stage.print()
+                return False
+            if not text:
+                continue
+            if text == "/quit":
+                return False
+            if text == "/restart":
+                return True
+            if text == "/stats":
+                stage.print(engine.stats_report())
+                continue
+            if text == "/notes":
+                for n in engine.memory.snapshot():
+                    stage.print(f"  - {n}")
+                continue
+
+            with stage.thinking(label):
+                turn = engine.say(text)
+            if turn.advanced:
+                stage.show(turn, f"Story point completed: {game.story[turn.story_idx].name}")
+                if turn.finished:
+                    stage.print(game.ending_text)
+                    stage.print(engine.stats_report())
+                    return False
+                stage.ask("  (press Enter to continue)")
+                with stage.thinking(label):
+                    turn = engine.continue_story()
+            stage.show(turn)
+    finally:
+        stage.close()
+
+
+def main(game: Game):
+    """Entry point for game files: parses --model/--host/--no-anim, checks Ollama and runs the terminal UI."""
+    ap = argparse.ArgumentParser(description=game.title)
+    ap.add_argument("--model", default=DEFAULT_MODEL)
+    ap.add_argument("--host", default=DEFAULT_HOST)
+    ap.add_argument("--no-anim", action="store_true", help="show still art instead of animations")
+    args = ap.parse_args()
+    try:
+        check_ollama(args.host, args.model)
+        while play_terminal(game, args.host, args.model, animate=not args.no_anim):
+            pass
+    except RuntimeError as e:
+        sys.exit(str(e))
+    except urllib.error.URLError as e:
+        sys.exit(f"Lost connection to Ollama: {e}")
+    print(game.farewell)
