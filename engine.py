@@ -35,12 +35,12 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Callable
 
-DEFAULT_MODEL = "gemma4:e2b"
-DEFAULT_HOST = "http://localhost:11434"
-MAX_HISTORY = 4  # recent messages sent verbatim; older context lives in the notes
-NOTES_LIMIT = 20  # compact the notes in the background once they exceed this
-NOTES_TARGET = 10  # roughly how many notes a compaction should leave
-ACTIONS = ["stay", "advance"]
+DEFAULT_MODEL = os.environ.get("DEFAULT_MODEL", "gemma4:e2b")  # Ollama model name (with optional :tag)
+DEFAULT_HOST = os.environ.get("DEFAULT_HOST", "http://localhost:11434")  # Ollama server URL
+MAX_HISTORY = int(os.environ.get("MAX_HISTORY", 4))  # recent messages sent verbatim; older context lives in the notes
+NOTES_LIMIT = int(os.environ.get("NOTES_LIMIT", 20))  # compact the notes in the background once they exceed this
+NOTES_TARGET = int(os.environ.get("NOTES_TARGET", 10))  # roughly how many notes a compaction should leave
+ACTIONS = os.environ.get("ACTIONS", "stay,advance").split(",")  # available actions in the game by the model
 
 
 # ------------------------------------------------------------------ animation
