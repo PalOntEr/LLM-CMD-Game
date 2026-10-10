@@ -2,14 +2,15 @@
 
 A terminal-based, story-driven conversational game framework powered by local LLMs via [Ollama](https://ollama.com) and local text-to-speech voice synthesis via [Kokoro](https://huggingface.co/hexgrad/Kokoro-82M).
 
-Features real-time animated ASCII characters that react with mood changes, fidgets, transitions, and thinking loops while you chat in the terminal, complete with voiced dialogue spoken in character.
+Features real-time animated ASCII characters that react with mood changes, fidgets, transitions, thinking loops, and lip-synced speaking animations while you chat in the terminal, complete with voiced dialogue spoken in character.
 
 ---
 
 ## Features
 
-- **Living ASCII Animations**: Characters idle, blink, look around, chuckle, and react dynamically. Animations update live on screen even while the player is typing.
-- **Local Character Voice (Kokoro TTS)**: Characters speak their dialogue aloud with fully local, in-memory voice synthesis. Non-blocking audio playback lets ASCII animations run seamlessly while speech plays.
+- **Living ASCII Animations**: Characters idle, blink, look around, chuckle, and speak dynamically. Mouths animate with speech cadence while audio plays, updating live on screen even while the player is typing.
+- **Local Character Voice (Kokoro TTS)**: Characters speak their dialogue aloud with fully local, in-memory voice synthesis. Non-blocking audio playback lets ASCII animations and mouth movements run seamlessly while speech plays.
+
 - **Dual Input Modes (Speech & Actions)**: Switch at any time between speaking to the character (`[say]`) and describing physical gestures or actions (`[action]`). The active mode is always clearly displayed on the input prompt.
 - **Attributed Memory & Compaction**: Maintains rolling memory notes that explicitly track who said or did what (`[Player]` vs `[Character]`). When notes exceed a threshold, a background thread summarizes and compacts older context without freezing gameplay.
 - **Ollama Powered**: Runs fully locally with any Ollama model (defaults to `gemma4:e2b`).

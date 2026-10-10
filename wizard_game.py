@@ -242,21 +242,44 @@ def draw(t: float, pose: Pose) -> str:
 
 
 # ----------------------------------------------------------------- animation
-def idle_pose(mood: str, t: float) -> Pose:
+SPEAKING_MOUTHS = {
+    "neutral": [" ____ ", " (..) ", " (  ) ", " \\__/ ", " -..- ", " (OO) "],
+    "stern": [" ---- ", " -..- ", " (..) ", " /--\\ ", " ---- ", " (--) "],
+    "angry": ["/VVVV\\", "/    \\", "|VVVV|", "/____\\", "|    |", "/VVVV\\"],
+    "pleased": ["\\____/", "\\_.._/", "\\    /", "\\____/", " (..) ", "\\_.._/"],
+    "warm": ["\\____/", "\\_.._/", "\\    /", "\\____/", " (..) ", "\\_.._/"],
+    "amused": [" \\__/~", " \\.. /~", " (..) ", " \\__/~", " (  ) ", " \\.. /~"],
+    "suspicious": [" ~~~~ ", " ~..~ ", " -..- ", " (..) ", " ~~~~ ", " -..- "],
+    "thoughtful": ["  ~~  ", "  ..  ", " (..) ", "  ~~  ", "  ..  ", " (  ) "],
+    "impressed": [" (  ) ", " (OO) ", " (..) ", " (  ) ", " (OO) ", " (..) "],
+}
+
+
+def speaking_mouth(mood: str, t: float) -> str:
+    """Cycle mouth shapes at conversational cadence (~7 changes/sec)."""
+    mouths = SPEAKING_MOUTHS.get(mood, SPEAKING_MOUTHS["neutral"])
+    return mouths[int(t * 7) % len(mouths)]
+
+
+def idle_pose(mood: str, t: float, speaking: bool = False) -> Pose:
     """How the wizard stands around in each mood. Uses global time so fidgets blend in without a jump."""
+    pose = Pose(mood)
     if mood == "angry":  # shakes his staff in fits, sparks flying
-        return Pose(mood, tilt=2.6 * math.sin(t * 8) * max(0.0, math.sin(t * 1.3)), orb="sparks")
-    if mood == "suspicious":  # shifty eyes
-        return Pose(mood, look=(0, 1, 1, 0, -1, -1)[int(t / 0.8) % 6])
-    if mood == "thoughtful":
-        return Pose(mood, look=2, orb="glow", power=0.3)
-    if mood == "impressed":
-        return Pose(mood, orb="flare", power=0.35)
-    if mood == "warm":
-        return Pose(mood, orb="glow", power=0.6)
-    if mood in ("pleased", "amused"):
-        return Pose(mood, orb="twinkle")
-    return Pose(mood)
+        pose = Pose(mood, tilt=2.6 * math.sin(t * 8) * max(0.0, math.sin(t * 1.3)), orb="sparks")
+    elif mood == "suspicious":  # shifty eyes
+        pose = Pose(mood, look=(0, 1, 1, 0, -1, -1)[int(t / 0.8) % 6])
+    elif mood == "thoughtful":
+        pose = Pose(mood, look=2, orb="glow", power=0.3)
+    elif mood == "impressed":
+        pose = Pose(mood, orb="flare", power=0.35)
+    elif mood == "warm":
+        pose = Pose(mood, orb="glow", power=0.6)
+    elif mood in ("pleased", "amused"):
+        pose = Pose(mood, orb="twinkle")
+
+    if speaking:
+        pose = replace(pose, mouth=speaking_mouth(mood, t))
+    return pose
 
 
 def clip(pose_at, length=0.0) -> Clip:
@@ -266,29 +289,29 @@ def clip(pose_at, length=0.0) -> Clip:
 
 def idle_with(**changes):
     """Pose function: the current mood's idle pose with some fields changed."""
-    return lambda cue: replace(idle_pose(cue.mood, cue.t), **changes)
+    return lambda cue: replace(idle_pose(cue.mood, cue.t, speaking=cue.speaking), **changes)
 
 
 def floating(word: str, length: float, **changes) -> Clip:
     """One-shot: a word drifts up beside his head."""
-    return clip(lambda cue: replace(idle_pose(cue.mood, cue.t), words=word, words_at=cue.progress, **changes),
+    return clip(lambda cue: replace(idle_pose(cue.mood, cue.t, speaking=cue.speaking), words=word, words_at=cue.progress, **changes),
                 length)
 
 
 def look_around(cue) -> Pose:
     look = next(look for until, look in ((0.3, 0), (1.0, -1), (1.3, 0), (2.1, 1), (9, 0)) if cue.local < until)
-    return replace(idle_pose(cue.mood, cue.t), look=look)
+    return replace(idle_pose(cue.mood, cue.t, speaking=cue.speaking), look=look)
 
 
 def chuckle(cue) -> Pose:
-    pose = replace(idle_pose(cue.mood, cue.t), words="ho ho", words_at=cue.progress)
+    pose = replace(idle_pose(cue.mood, cue.t, speaking=cue.speaking), words="ho ho", words_at=cue.progress)
     return replace(pose, mouth="\\_oo_/" if int(cue.local * 6) % 2 else "\\____/")
 
 
 def blink_between(cue) -> Pose:
     """Generic mood change: blink, and open the eyes on the new expression."""
     mood = cue.mood if cue.progress >= 0.5 else cue.prev_mood
-    return replace(idle_pose(mood, cue.t), lid="closed" if 0.25 < cue.progress < 0.75 else "")
+    return replace(idle_pose(mood, cue.t, speaking=cue.speaking), lid="closed" if 0.25 < cue.progress < 0.75 else "")
 
 
 def flare_up(cue) -> Pose:
@@ -301,7 +324,7 @@ def flare_up(cue) -> Pose:
 def calm_down(cue) -> Pose:
     """Out of anger: eyes shut, a long breath, the sparks die out."""
     p = cue.progress
-    return replace(idle_pose(cue.mood, cue.t), lid="closed" if p < 0.6 else "", orb="sparks", power=1 - p,
+    return replace(idle_pose(cue.mood, cue.t, speaking=cue.speaking), lid="closed" if p < 0.6 else "", orb="sparks", power=1 - p,
                    words="hmph", words_at=p)
 
 
@@ -319,7 +342,8 @@ LOOK = Fidget(clip(look_around, 2.6), every=(6.0, 12.0))
 HMPH = Fidget(floating("hmph", 1.4), every=(5.0, 10.0))
 
 ANIMATIONS = Animations(
-    idle={"*": clip(lambda cue: idle_pose(cue.mood, cue.t))},
+    idle={"*": clip(lambda cue: idle_pose(cue.mood, cue.t, speaking=cue.speaking))},
+    speaking=clip(lambda cue: idle_pose(cue.mood, cue.t, speaking=True)),
     transitions={
         ("*", "angry"): clip(flare_up, 1.0),
         ("angry", "*"): clip(calm_down, 1.2),
@@ -336,6 +360,7 @@ ANIMATIONS = Animations(
     },
     thinking=clip(ponder),
 )
+
 
 GAME = Game(
     title="The Old Wizard",

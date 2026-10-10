@@ -99,28 +99,35 @@ class VoiceSpeaker:
         self.stop()
 
         def _worker():
-            if os.name == "nt":
-                import winsound
-                try:
+            try:
+                if os.name == "nt":
+                    import winsound
                     winsound.PlaySound(data, winsound.SND_MEMORY)
-                except Exception:
-                    pass
-            else:
-                # Fallback for non-Windows platforms if soundfile / sounddevice available
-                try:
-                    import sounddevice as sd
-                    import soundfile as sf
-                    audio, sr = sf.read(io.BytesIO(data))
-                    sd.play(audio, sr)
-                    sd.wait()
-                except Exception:
-                    pass
+                else:
+                    # Fallback for non-Windows platforms if soundfile / sounddevice available
+                    try:
+                        import sounddevice as sd
+                        import soundfile as sf
+                        audio, sr = sf.read(io.BytesIO(data))
+                        sd.play(audio, sr)
+                        sd.wait()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            finally:
+                if threading.current_thread() == self._current_thread:
+                    self._current_thread = None
 
         self._current_thread = threading.Thread(target=_worker, daemon=True)
         self._current_thread.start()
 
         if block:
             self._current_thread.join()
+
+    def is_speaking(self) -> bool:
+        """Return True if speech audio is currently playing."""
+        return bool(self._current_thread and self._current_thread.is_alive())
 
     def speak(self, text: str, block: bool = False):
         """Convenience method to synthesize and immediately play audio."""
@@ -136,4 +143,5 @@ class VoiceSpeaker:
             except Exception:
                 pass
         self._current_thread = None
+
 

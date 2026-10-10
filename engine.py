@@ -80,6 +80,7 @@ class Cue:
     progress: float  # 0..1 through a one-shot clip (always 0 for looping clips)
     mood: str  # current mood
     prev_mood: str  # mood before the latest change, handy for transitions
+    speaking: bool = False  # True while speech audio is playing
 
 
 @dataclass
@@ -125,6 +126,7 @@ class Animations:
     transitions: dict = field(default_factory=dict)  # (from_mood, to_mood) -> one-shot Clip; either may be "*"
     fidgets: dict = field(default_factory=dict)  # mood -> list[Fidget]; "*" covers moods without their own
     thinking: object = None  # looping Clip shown while the model generates a reply; None keeps idling
+    speaking: object = None  # looping Clip (or dict: mood -> Clip) shown while speaking; None uses idle with cue.speaking=True
 
     def __post_init__(self):
         if not self.idle:
@@ -135,6 +137,11 @@ class Animations:
 
     def idle_for(self, mood: str) -> Clip:
         return self.idle.get(mood) or self.idle.get("*") or next(iter(self.idle.values()))
+
+    def speaking_for(self, mood: str):
+        if isinstance(self.speaking, dict):
+            return self.speaking.get(mood) or self.speaking.get("*")
+        return self.speaking
 
     def fidgets_for(self, mood: str) -> list:
         return self.fidgets.get(mood, self.fidgets.get("*", []))
@@ -148,8 +155,8 @@ class Animations:
 
 class Animator:
     """Decides what the character shows over time: transitions, the mood's idle loop, random fidgets and the
-    thinking loop. UI-free and not thread-safe: call set_mood()/set_thinking() as the game changes and frame()
-    whenever you want to draw (from one thread, or under a lock)."""
+    thinking/speaking loops. UI-free and not thread-safe: call set_mood()/set_thinking()/set_speaking() as the game
+    changes and frame() whenever you want to draw (from one thread, or under a lock)."""
 
     def __init__(self, anims: Animations, mood: str, clock=time.monotonic, rng=None):
         self.anims, self.clock = anims, clock
@@ -157,6 +164,7 @@ class Animator:
         self.t0 = clock()
         self.mood = self.prev_mood = mood
         self.thinking = False
+        self.speaking = False
         self.due = {}  # fidget index -> time it should play, for the current mood's fidgets
         self._settle(self.t0)
 
@@ -178,6 +186,12 @@ class Animator:
             if self.kind != "transition":  # a transition finishes first, then settles into the right loop
                 self._settle(self.clock())
 
+    def set_speaking(self, on: bool):
+        if on != self.speaking:
+            self.speaking = on
+            if self.kind != "transition":
+                self._settle(self.clock())
+
     def frame(self, now=None) -> str:
         now = self.clock() if now is None else now
         if now - self.start >= self.clip.duration:
@@ -190,20 +204,25 @@ class Animator:
                 self._play(self.anims.fidgets_for(self.mood)[i].clip, "fidget", now)
         local = now - self.start
         progress = 0.0 if self.clip.loop else min(1.0, local / self.clip.duration)
-        return self.clip.render(Cue(now - self.t0, local, progress, self.mood, self.prev_mood))
+        return self.clip.render(Cue(now - self.t0, local, progress, self.mood, self.prev_mood, self.speaking))
 
     def _play(self, clip: Clip, kind: str, now: float):
         self.clip, self.kind, self.start = clip, kind, now
 
     def _settle(self, now: float):
-        """Go back to the resting loop: thinking if the model is busy, otherwise the mood's idle."""
+        """Go back to the resting loop: thinking if the model is busy, speaking if audio plays, otherwise idle."""
         if self.thinking and self.anims.thinking:
             self._play(self.anims.thinking, "thinking", now)
+            return
+        speaking_clip = self.anims.speaking_for(self.mood) if self.speaking else None
+        if self.speaking and speaking_clip:
+            self._play(speaking_clip, "speaking", now)
             return
         self._play(self.anims.idle_for(self.mood), "idle", now)
         for i, f in enumerate(self.anims.fidgets_for(self.mood)):
             if self.due.get(i, 0) <= now:  # unscheduled or overdue: (re)schedule so fidgets don't pile up
                 self.due[i] = now + self.rng.uniform(*f.every)
+
 
 
 class Canvas:
@@ -585,8 +604,8 @@ class Stage:
     The art is redrawn with ANSI cursor moves, so every row printed below it must go through print()/ask():
     the stage counts them to know where the art has scrolled to."""
 
-    def __init__(self, game: Game, animate=True, fps=12):
-        self.game, self.fps = game, fps
+    def __init__(self, game: Game, animate=True, fps=12, speaker=None):
+        self.game, self.fps, self.speaker = game, fps, speaker
         self.animator = Animator(game.animations, game.moods[0])
         self.live = animate and enable_ansi()
         self.lock = threading.RLock()
@@ -624,6 +643,8 @@ class Stage:
             if turn:
                 self.animator.set_thinking(False)
                 self.animator.set_mood(turn.mood)
+                if self.speaker:
+                    self.animator.set_speaking(self.speaker.is_speaking())
             idx = turn.story_idx if turn else 0
             self.clear()
             self.print(f"=== {game.title.upper()} ===   Story point {idx + 1}/{len(game.story)}: "
@@ -681,6 +702,8 @@ class Stage:
     def _draw(self):
         if self.art_top is None:
             return
+        if self.speaker:
+            self.animator.set_speaking(self.speaker.is_speaking())
         size = shutil.get_terminal_size()
         lines = self.animator.frame().split("\n")[:len(self.drawn)]
         lines += [""] * (len(self.drawn) - len(lines))
@@ -702,7 +725,6 @@ class Stage:
 def play_terminal(game: Game, host: str, model: str, animate=True, voice=True) -> bool:
     """Run one playthrough. Returns True if the player asked to restart."""
     engine = Engine(game, host, model)
-    stage = Stage(game, animate)
     label = f"{game.character} ponders"
 
     speaker = None
@@ -711,6 +733,9 @@ def play_terminal(game: Game, host: str, model: str, animate=True, voice=True) -
             speaker = VoiceSpeaker(game.voice, speed=getattr(game, "voice_speed", 1.0))
         except Exception:
             speaker = None
+
+    stage = Stage(game, animate, speaker=speaker)
+
 
     mode = "say"
     try:
