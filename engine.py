@@ -202,3 +202,131 @@ class Canvas:
         return "\n".join("".join(row).rstrip() for row in self.grid)
 
 
+# ------------------------------------------------------------ game definition
+@dataclass
+class StoryPoint:
+    name: str
+    goal: str  # what the character is trying to do / what the scene is about
+    done: str  # the condition under which the model may answer action="advance"
+
+
+@dataclass
+class Game:
+    title: str
+    character: str  # display name of the character the player talks to
+    persona: str  # system-prompt text: who the character is, the world, and what the player wants
+    story: list  # list[StoryPoint], played in order
+    moods: list  # strict list of mood strings the model may use; moods[0] is the default
+    art: Callable[[str], str] = None  # mood -> still ASCII art (derived from `animations` if omitted)
+    animations: Animations = None  # animated art (derived from `art`, standing still, if omitted)
+    opening_nudge: str = "(The player approaches. Speak first, in character.)"
+    next_nudge: str = "(The story moves on to the next point. Speak first, in character.)"
+    ending_text: str = "THE END."
+    farewell: str = "Goodbye."  # printed when the program exits
+    fallback_line: str = "...Say that again?"  # shown if the model fails twice in a row
+    keep_hint: str = "names, promises, motives, key events, opinions"  # what compaction must preserve
+
+    def __post_init__(self):
+        if not self.story or not self.moods:
+            raise ValueError("A Game needs at least one story point and one mood")
+        if self.art is None and self.animations is None:
+            raise ValueError("A Game needs art, animations, or both")
+        if self.animations is None:
+            art = self.art
+            self.animations = Animations(idle={"*": Clip(lambda cue: art(cue.mood))})
+        if self.art is None:
+            anims = self.animations
+            self.art = lambda mood: anims.idle_for(mood).render(Cue(0.0, 0.0, 0.0, mood, mood))
+
+
+# ------------------------------------------------------------------- protocol
+def build_schema(moods) -> dict:
+    return {
+        "type": "object",
+        "properties": {
+            "speak": {"type": "string"},
+            "mood": {"type": "string", "enum": list(moods)},
+            "action": {"type": "string", "enum": ACTIONS},
+            "notes": {"type": "string"},
+        },
+        "required": ["speak", "mood", "action", "notes"],
+    }
+
+
+COMPACT_SCHEMA = {
+    "type": "object",
+    "properties": {"notes": {"type": "string"}},
+    "required": ["notes"],
+}
+
+
+def build_system_prompt(game: Game, idx: int, notes=()) -> str:
+    sp = game.story[idx]
+    notes_block = ""
+    if notes:
+        notes_block = ("\nYOUR NOTES SO FAR about this player and the conversation (older messages are not shown, "
+                       "rely on these):\n" + "\n".join(f"- {n}" for n in notes) + "\n")
+    return f"""{game.persona}
+
+The story has {len(game.story)} points. CURRENT STORY POINT ({idx + 1}/{len(game.story)}): {sp.name}
+Your goal now: {sp.goal}
+Set action to "advance" ONLY when this is true: {sp.done}
+Otherwise set action to "stay". Do not rush; never advance on the first reply of a story point unless clearly satisfied.
+{notes_block}
+You MUST reply with ONLY a JSON object, exactly in this format:
+{{"speak": "what you say", "mood": "<one of: {', '.join(game.moods)}>", "action": "<stay or advance>", \
+"notes": "<comma-separated short notes>"}}
+"notes" = important facts from the player's last message and from your own reply that you must remember later \
+(player's name, their motives, claims, promises, what you revealed or did). Short phrases separated by commas, \
+no commas inside a single note. Use "" if nothing important."""
+
+
+def split_notes(raw) -> list:
+    """Turn a comma-separated string (or a list, if the model ignores the schema) into clean notes."""
+    if isinstance(raw, list):
+        raw = ",".join(str(x) for x in raw)
+    if not isinstance(raw, str):
+        return []
+    return [n.strip() for n in raw.split(",") if n.strip()]
+
+
+def parse_reply(raw: str, moods):
+    """Return (dict, ok). Always returns a usable dict; ok=False if it had to be repaired."""
+    try:
+        data = json.loads(raw)
+        if not isinstance(data, dict) or not isinstance(data.get("speak"), str) or not data["speak"].strip():
+            raise ValueError("bad speak")
+    except (json.JSONDecodeError, ValueError):
+        return {"speak": "", "mood": moods[0], "action": "stay", "notes": ""}, False
+    ok = data.get("mood") in moods and data.get("action") in ACTIONS and "notes" in data
+    data["notes"] = ",".join(split_notes(data.get("notes")))
+    if data.get("mood") not in moods:
+        data["mood"] = moods[0]
+    if data.get("action") not in ACTIONS:
+        data["action"] = "stay"
+    return data, ok
+
+
+def chat(host: str, model: str, messages: list, schema: dict, num_predict=400):
+    body = json.dumps({
+        "model": model, "messages": messages, "stream": False, "format": schema,
+        "think": False,  # thinking tokens made each turn ~25x slower
+        "options": {"temperature": 0.7, "num_predict": num_predict},
+    }).encode()
+    req = urllib.request.Request(f"{host}/api/chat", body, {"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=300) as resp:
+        return json.loads(resp.read())
+
+
+def check_ollama(host: str, model: str):
+    """Raise RuntimeError with a friendly message if Ollama or the model is unavailable."""
+    try:
+        with urllib.request.urlopen(f"{host}/api/tags", timeout=5) as r:
+            names = [m["name"] for m in json.loads(r.read()).get("models", [])]
+    except (urllib.error.URLError, OSError):
+        raise RuntimeError(f"Cannot reach Ollama at {host}. Start it with 'ollama serve'.")
+    if model not in names and f"{model}:latest" not in names:
+        raise RuntimeError(f"Model '{model}' not found. Run: ollama pull {model}\n"
+                           f"Installed: {', '.join(names) or 'none'}")
+
+
