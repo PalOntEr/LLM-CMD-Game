@@ -18,7 +18,7 @@ mood, one-shot transition Clips between moods, random Fidgets (blinks, glances) 
 the model generates. The terminal UI keeps the art moving in place while the player types (--no-anim turns it
 off).
 
-Commands in the terminal UI: /quit, /restart, /stats, /notes, /switch, /help
+Commands in the terminal UI: /quit, /restart, /stats, /notes, /switch, /save, /load, /saves, /help
 """
 import argparse
 import json
@@ -571,6 +571,159 @@ class Engine:
         return (f"{self.stats.report()}\nNotes: {len(m.snapshot())} | compactions: {m.compactions} "
                 f"(failed: {m.compact_failures}, last took {m.last_compact_s:.1f}s)")
 
+    def to_dict(self, last_turn: Turn = None, mode: str = "say") -> dict:
+        """Serializes game state and the exact payload sent to the model into a dict."""
+        idx = self.idx
+        sp = self.story_point if idx < len(self.game.story) else None
+        notes = self.memory.snapshot()
+        system_prompt = build_system_prompt(self.game, idx, notes)
+        recent_context = self.history[-MAX_HISTORY:] if self.history else [{"role": "user", "content": self.game.opening_nudge}]
+        messages_to_model = [{"role": "system", "content": system_prompt}] + recent_context
+
+        model_payload = {
+            "model": self.model,
+            "messages": messages_to_model,
+            "stream": False,
+            "format": self.schema,
+            "think": False,
+            "options": {"temperature": 0.7, "num_predict": 400},
+        }
+
+        turn_dict = None
+        if last_turn:
+            turn_dict = {
+                "speak": last_turn.speak,
+                "mood": last_turn.mood,
+                "action": last_turn.action,
+                "footer": last_turn.footer,
+                "story_idx": last_turn.story_idx,
+                "advanced": last_turn.advanced,
+                "finished": last_turn.finished,
+            }
+
+        return {
+            "version": 1,
+            "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "game_title": self.game.title,
+            "character": self.game.character,
+            "story_idx": self.idx,
+            "story_point": {
+                "name": sp.name if sp else "Completed",
+                "goal": sp.goal if sp else "",
+                "done": sp.done if sp else "",
+            } if sp else None,
+            "input_mode": mode,
+            "current_mood": last_turn.mood if last_turn else self.game.moods[0],
+            "model": self.model,
+            "host": self.host,
+            "system_prompt": system_prompt,
+            "messages_sent_to_model": messages_to_model,
+            "model_payload": model_payload,
+            "history": list(self.history),
+            "notes": notes,
+            "last_turn": turn_dict,
+            "stats": {
+                "turns": self.stats.turns,
+                "tokens": self.stats.tokens,
+                "gen_ns": self.stats.gen_ns,
+                "latency": self.stats.latency,
+                "repairs": self.stats.repairs,
+                "failures": self.stats.failures,
+            },
+        }
+
+    def save(self, filepath: str = "savegame.json", last_turn: Turn = None, mode: str = "say") -> str:
+        """Saves everything sent to the model and game state to a JSON file."""
+        data = self.to_dict(last_turn=last_turn, mode=mode)
+        dirname = os.path.dirname(filepath)
+        if dirname:
+            os.makedirs(dirname, exist_ok=True)
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        return os.path.abspath(filepath)
+
+    def load(self, filepath: str = "savegame.json") -> tuple[Turn, str]:
+        """Loads state from a JSON save file. Returns (last_turn, mode)."""
+        with open(filepath, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        self.idx = data.get("story_idx", 0)
+        self.history = list(data.get("history", []))
+
+        notes = data.get("notes", [])
+        with self.memory.lock:
+            self.memory.notes = list(notes)
+
+        stats_data = data.get("stats", {})
+        self.stats.turns = stats_data.get("turns", 0)
+        self.stats.tokens = stats_data.get("tokens", 0)
+        self.stats.gen_ns = stats_data.get("gen_ns", 0)
+        self.stats.latency = stats_data.get("latency", 0.0)
+        self.stats.repairs = stats_data.get("repairs", 0)
+        self.stats.failures = stats_data.get("failures", 0)
+
+        mode = data.get("input_mode", data.get("mode", "say"))
+
+        turn_data = data.get("last_turn")
+        if turn_data:
+            turn = Turn(
+                speak=turn_data.get("speak", ""),
+                mood=turn_data.get("mood", self.game.moods[0]),
+                action=turn_data.get("action", "stay"),
+                footer=turn_data.get("footer", f"[Loaded from {os.path.basename(filepath)}]"),
+                story_idx=turn_data.get("story_idx", self.idx),
+                advanced=turn_data.get("advanced", False),
+                finished=turn_data.get("finished", False),
+            )
+        else:
+            last_speak = ""
+            last_mood = data.get("current_mood", self.game.moods[0])
+            for msg in reversed(self.history):
+                if msg.get("role") == "assistant":
+                    try:
+                        content_json = json.loads(msg.get("content", "{}"))
+                        last_speak = content_json.get("speak", "")
+                        last_mood = content_json.get("mood", last_mood)
+                    except Exception:
+                        last_speak = msg.get("content", "")
+                    break
+            turn = Turn(
+                speak=last_speak,
+                mood=last_mood,
+                action="stay",
+                footer=f"[Loaded from {os.path.basename(filepath)}]",
+                story_idx=self.idx,
+            )
+
+        return turn, mode
+
+
+def find_save_files(directory=".") -> list[dict]:
+    """Scans for valid game save JSON files in the given directory."""
+    results = []
+    try:
+        for fname in os.listdir(directory):
+            if fname.endswith(".json"):
+                path = os.path.join(directory, fname)
+                try:
+                    with open(path, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    if isinstance(data, dict) and ("model_payload" in data or "saved_at" in data or "story_idx" in data):
+                        sp = data.get("story_point")
+                        sp_name = sp.get("name") if isinstance(sp, dict) else data.get("story_name", "")
+                        results.append({
+                            "filename": fname,
+                            "path": path,
+                            "saved_at": data.get("saved_at", "Unknown"),
+                            "character": data.get("character", "Unknown"),
+                            "story": sp_name or f"Point #{data.get('story_idx', 0) + 1}",
+                        })
+                except Exception:
+                    pass
+    except OSError:
+        pass
+    return sorted(results, key=lambda x: x["saved_at"], reverse=True)
+
 
 # ---------------------------------------------------------------- terminal UI
 def enable_ansi() -> bool:
@@ -722,7 +875,7 @@ class Stage:
             sys.stdout.flush()
 
 
-def play_terminal(game: Game, host: str, model: str, animate=True, voice=True) -> bool:
+def play_terminal(game: Game, host: str, model: str, animate=True, voice=True, load_path: str = None) -> bool:
     """Run one playthrough. Returns True if the player asked to restart."""
     engine = Engine(game, host, model)
     label = f"{game.character} ponders"
@@ -736,17 +889,28 @@ def play_terminal(game: Game, host: str, model: str, animate=True, voice=True) -
 
     stage = Stage(game, animate, speaker=speaker)
 
-
     mode = "say"
+    turn = None
     try:
-        stage.show()
-        with stage.thinking(label):
-            turn = engine.start()
+        if load_path:
+            try:
+                turn, loaded_mode = engine.load(load_path)
+                mode = loaded_mode
+                stage.show(turn, banner=f"GAME LOADED: {os.path.basename(load_path)}")
+                stage.print(f"  [LOAD SUCCESSFUL] Resumed at Story Point {engine.idx + 1}/{len(game.story)}. Awaiting player action.\n")
+            except Exception as e:
+                stage.print(f"  [LOAD ERROR] Could not load {load_path}: {e}\n  Starting fresh game...\n")
+                turn = None
+
+        if turn is None:
+            stage.show()
+            with stage.thinking(label):
+                turn = engine.start()
+                if speaker:
+                    speaker.prepare(turn.speak)
+            stage.show(turn)
             if speaker:
-                speaker.prepare(turn.speak)
-        stage.show(turn)
-        if speaker:
-            speaker.play()
+                speaker.play()
 
         while True:
             try:
@@ -788,9 +952,69 @@ def play_terminal(game: Game, host: str, model: str, animate=True, voice=True) -
                 desc = f"speak to {game.character}" if mode == "say" else "describe physical action/gesture"
                 stage.print(f"  Input mode switched to: [{mode}] ({desc})\n")
                 continue
+
+            # --- SAVE COMMAND ---
+            if (
+                text == "/save"
+                or text.startswith("/save ")
+                or text.lower() == "save"
+                or (text.lower().startswith("save ") and text.lower().endswith(".json"))
+            ):
+                parts = text.split(maxsplit=1)
+                filename = parts[1].strip().strip("'\"") if len(parts) > 1 else "savegame.json"
+                if not os.path.splitext(filename)[1]:
+                    filename += ".json"
+                try:
+                    saved_path = engine.save(filename, last_turn=turn, mode=mode)
+                    stage.print(f"\n  [SAVE SUCCESSFUL] Game state & model payload saved to:\n  -> {saved_path}\n")
+                except Exception as e:
+                    stage.print(f"\n  [SAVE ERROR] Failed to save game: {e}\n")
+                continue
+
+            # --- LOAD COMMAND ---
+            if (
+                text == "/load"
+                or text.startswith("/load ")
+                or text.lower() == "load"
+                or (text.lower().startswith("load ") and text.lower().endswith(".json"))
+            ):
+                parts = text.split(maxsplit=1)
+                filename = parts[1].strip().strip("'\"") if len(parts) > 1 else "savegame.json"
+                if not os.path.splitext(filename)[1]:
+                    filename += ".json"
+                try:
+                    turn, mode = engine.load(filename)
+                    stage.show(turn, banner=f"GAME LOADED: {os.path.basename(filename)}")
+                    stage.print(f"  [LOAD SUCCESSFUL] Resumed at Story Point {engine.idx + 1}/{len(game.story)}. Awaiting player action.\n")
+                except FileNotFoundError:
+                    stage.print(f"\n  [LOAD ERROR] File '{filename}' not found.")
+                    saves = find_save_files()
+                    if saves:
+                        stage.print("  Available save files in directory:")
+                        for s in saves:
+                            stage.print(f"    - {s['filename']} ({s['saved_at']} | {s['story']})")
+                    stage.print()
+                except Exception as e:
+                    stage.print(f"\n  [LOAD ERROR] Failed to load save file: {e}\n")
+                continue
+
+            if text in ("/saves", "/list"):
+                saves = find_save_files()
+                if saves:
+                    stage.print("\n  Available save files:")
+                    for s in saves:
+                        stage.print(f"    - {s['filename']} (Saved: {s['saved_at']} | Story: {s['story']})")
+                    stage.print()
+                else:
+                    stage.print("\n  No save files found in current directory.\n")
+                continue
+
             if text == "/help":
                 stage.print("\n  Available commands:")
                 stage.print(f"    /switch [say|action]  Toggle or set input mode (current: [{mode}])")
+                stage.print("    /save [filename]      Save game state & model payload to JSON (default: savegame.json)")
+                stage.print("    /load [filename]      Load saved game & resume waiting for player input")
+                stage.print("    /saves                List available save files in current directory")
                 stage.print("    /notes                Show the character's memory notes")
                 stage.print("    /stats                Show session token and timing stats")
                 stage.print("    /restart              Restart story from the beginning")
@@ -826,17 +1050,19 @@ def play_terminal(game: Game, host: str, model: str, animate=True, voice=True) -
 
 
 def main(game: Game):
-    """Entry point for game files: parses --model/--host/--no-anim/--no-voice, checks Ollama and runs the terminal UI."""
+    """Entry point for game files: parses --model/--host/--no-anim/--no-voice/--load, checks Ollama and runs the terminal UI."""
     ap = argparse.ArgumentParser(description=game.title)
     ap.add_argument("--model", default=DEFAULT_MODEL)
     ap.add_argument("--host", default=DEFAULT_HOST)
     ap.add_argument("--no-anim", action="store_true", help="show still art instead of animations")
     ap.add_argument("--no-voice", action="store_true", help="do not use voice audio for character replies")
+    ap.add_argument("--load", default=None, help="load saved game JSON file on startup")
     args = ap.parse_args()
     try:
         check_ollama(args.host, args.model)
-        while play_terminal(game, args.host, args.model, animate=not args.no_anim, voice=not args.no_voice):
-            pass
+        load_file = args.load
+        while play_terminal(game, args.host, args.model, animate=not args.no_anim, voice=not args.no_voice, load_path=load_file):
+            load_file = None  # on restart, start fresh
     except RuntimeError as e:
         sys.exit(str(e))
     except urllib.error.URLError as e:
