@@ -35,6 +35,32 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Callable
 
+def load_dotenv(file_path=".env"):
+    # Check if the file exists to avoid a FileNotFoundError
+    if not os.path.exists(file_path):
+        return
+
+    with open(file_path, "r") as file:
+        for line in file:
+            # Remove whitespace and skip empty lines or comments
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+
+            # Split by the first '=' character only
+            if "=" in line:
+                key, value = line.split("=", 1)
+
+                # Optional: Strip whitespace and quotes around values
+                key = key.strip()
+                value = value.strip().strip("'\"")
+
+                # Inject into the environment variables
+                os.environ[key] = value
+
+# Run the function
+load_dotenv()
+
 DEFAULT_MODEL = os.environ.get("DEFAULT_MODEL", "gemma4:e2b")  # Ollama model name (with optional :tag)
 DEFAULT_HOST = os.environ.get("DEFAULT_HOST", "http://localhost:11434")  # Ollama server URL
 MAX_HISTORY = int(os.environ.get("MAX_HISTORY", 4))  # recent messages sent verbatim; older context lives in the notes
