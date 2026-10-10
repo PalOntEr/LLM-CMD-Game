@@ -510,7 +510,8 @@ class Engine:
 
     @property
     def story_point(self) -> StoryPoint:
-        return self.game.story[self.idx]
+        safe_idx = min(self.idx, len(self.game.story) - 1)
+        return self.game.story[safe_idx]
 
     def start(self) -> Turn:
         """The character speaks first."""
@@ -574,9 +575,11 @@ class Engine:
     def to_dict(self, last_turn: Turn = None, mode: str = "say") -> dict:
         """Serializes game state and the exact payload sent to the model into a dict."""
         idx = self.idx
-        sp = self.story_point if idx < len(self.game.story) else None
+        is_completed = idx >= len(self.game.story)
+        safe_idx = min(idx, len(self.game.story) - 1)
+        sp = self.game.story[safe_idx] if self.game.story else None
         notes = self.memory.snapshot()
-        system_prompt = build_system_prompt(self.game, idx, notes)
+        system_prompt = build_system_prompt(self.game, safe_idx, notes)
         recent_context = self.history[-MAX_HISTORY:] if self.history else [{"role": "user", "content": self.game.opening_nudge}]
         messages_to_model = [{"role": "system", "content": system_prompt}] + recent_context
 
@@ -604,11 +607,12 @@ class Engine:
         return {
             "version": 1,
             "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "completed": is_completed,
             "game_title": self.game.title,
             "character": self.game.character,
             "story_idx": self.idx,
             "story_point": {
-                "name": sp.name if sp else "Completed",
+                "name": ("Completed: " + sp.name) if (is_completed and sp) else (sp.name if sp else "Completed"),
                 "goal": sp.goal if sp else "",
                 "done": sp.done if sp else "",
             } if sp else None,
@@ -1032,6 +1036,15 @@ def play_terminal(game: Game, host: str, model: str, animate=True, voice=True, l
                 if turn.finished:
                     stage.print(game.ending_text)
                     stage.print(engine.stats_report())
+                    # Auto-save completion log before closing
+                    try:
+                        timestamp = time.strftime("%Y%m%d_%H%M%S")
+                        log_filename = f"completed_{timestamp}.json"
+                        log_path = engine.save(log_filename, last_turn=turn, mode=mode)
+                        engine.save("savegame.json", last_turn=turn, mode=mode)
+                        stage.print(f"\n  [AUTO-SAVE] Game completed. Session log automatically saved to:\n  -> {log_path}\n  -> {os.path.abspath('savegame.json')}\n")
+                    except Exception as e:
+                        stage.print(f"\n  [AUTO-SAVE ERROR] Failed to save completion log: {e}\n")
                     return False
                 stage.ask("  (press Enter to continue)")
                 if speaker:

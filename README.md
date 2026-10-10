@@ -108,6 +108,9 @@ Type these commands at the prompt at any time:
 - `/help` – Show list of available commands.
 - `/quit` – Exit the game.
 
+> [!NOTE]
+> **Automatic Completion Save**: When a playthrough finishes (all story points are completed), the engine automatically executes the save routine before closing the program. It writes an immutable session log to `completed_<timestamp>.json` and updates `savegame.json`, preserving the complete conversation, memory notes, and final model payload for future reference.
+
 ---
 
 ## What Is Sent to the Model on Each Call
@@ -205,7 +208,7 @@ Whenever you type `/save` (or `/save <filename>`), the engine writes:
 - The full unbroken `history` and `notes`
 - The current `story_idx`, `input_mode`, and character `current_mood`
 
-You can open the resulting `.json` file at any time to inspect the exact prompt and token configuration delivered to the model for that turn.
+You can open the resulting `.json` file at any time to inspect the exact prompt and token configuration delivered to the model for that turn. When a game completes, this same routine is automatically triggered to create `completed_<timestamp>.json` as an archived post-game session log.
 
 ---
 
