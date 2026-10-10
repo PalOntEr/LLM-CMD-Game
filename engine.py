@@ -34,6 +34,7 @@ import urllib.request
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Callable
+from audio import VoiceSpeaker
 
 def load_dotenv(file_path=".env"):
     # Check if the file exists to avoid a FileNotFoundError
@@ -243,6 +244,8 @@ class Game:
     persona: str  # system-prompt text: who the character is, the world, and what the player wants
     story: list  # list[StoryPoint], played in order
     moods: list  # strict list of mood strings the model may use; moods[0] is the default
+    voice: str = None  # name of the character's voice (e.g. 'bm_george', 'am_adam')
+    voice_speed: float = 1.0  # speech speed multiplier (1.0 = normal, 0.9 = slower/older)
     art: Callable[[str], str] = None  # mood -> still ASCII art (derived from `animations` if omitted)
     animations: Animations = None  # animated art (derived from `art`, standing still, if omitted)
     opening_nudge: str = "(The player approaches. Speak first, in character.)"
@@ -654,25 +657,41 @@ class Stage:
             sys.stdout.flush()
 
 
-def play_terminal(game: Game, host: str, model: str, animate=True) -> bool:
+def play_terminal(game: Game, host: str, model: str, animate=True, voice=True) -> bool:
     """Run one playthrough. Returns True if the player asked to restart."""
     engine = Engine(game, host, model)
     stage = Stage(game, animate)
     label = f"{game.character} ponders"
+
+    speaker = None
+    if voice and getattr(game, "voice", None):
+        try:
+            speaker = VoiceSpeaker(game.voice, speed=getattr(game, "voice_speed", 1.0))
+        except Exception:
+            speaker = None
+
     try:
         stage.show()
         with stage.thinking(label):
             turn = engine.start()
+            if speaker:
+                speaker.prepare(turn.speak)
         stage.show(turn)
+        if speaker:
+            speaker.play()
 
         while True:
             try:
                 text = stage.ask("You > ").strip()
             except (EOFError, KeyboardInterrupt):
+                if speaker:
+                    speaker.stop()
                 stage.print()
                 return False
             if not text:
                 continue
+            if speaker:
+                speaker.stop()
             if text == "/quit":
                 return False
             if text == "/restart":
@@ -687,30 +706,43 @@ def play_terminal(game: Game, host: str, model: str, animate=True) -> bool:
 
             with stage.thinking(label):
                 turn = engine.say(text)
+                if speaker:
+                    speaker.prepare(turn.speak)
             if turn.advanced:
                 stage.show(turn, f"Story point completed: {game.story[turn.story_idx].name}")
+                if speaker:
+                    speaker.play()
                 if turn.finished:
                     stage.print(game.ending_text)
                     stage.print(engine.stats_report())
                     return False
                 stage.ask("  (press Enter to continue)")
+                if speaker:
+                    speaker.stop()
                 with stage.thinking(label):
                     turn = engine.continue_story()
+                    if speaker:
+                        speaker.prepare(turn.speak)
             stage.show(turn)
+            if speaker:
+                speaker.play()
     finally:
+        if speaker:
+            speaker.stop()
         stage.close()
 
 
 def main(game: Game):
-    """Entry point for game files: parses --model/--host/--no-anim, checks Ollama and runs the terminal UI."""
+    """Entry point for game files: parses --model/--host/--no-anim/--no-voice, checks Ollama and runs the terminal UI."""
     ap = argparse.ArgumentParser(description=game.title)
     ap.add_argument("--model", default=DEFAULT_MODEL)
     ap.add_argument("--host", default=DEFAULT_HOST)
     ap.add_argument("--no-anim", action="store_true", help="show still art instead of animations")
+    ap.add_argument("--no-voice", action="store_true", help="do not use voice audio for character replies")
     args = ap.parse_args()
     try:
         check_ollama(args.host, args.model)
-        while play_terminal(game, args.host, args.model, animate=not args.no_anim):
+        while play_terminal(game, args.host, args.model, animate=not args.no_anim, voice=not args.no_voice):
             pass
     except RuntimeError as e:
         sys.exit(str(e))
