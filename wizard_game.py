@@ -318,3 +318,37 @@ BLINK = Fidget(clip(idle_with(lid="closed"), 0.15), every=(2.5, 6.0))
 LOOK = Fidget(clip(look_around, 2.6), every=(6.0, 12.0))
 HMPH = Fidget(floating("hmph", 1.4), every=(5.0, 10.0))
 
+ANIMATIONS = Animations(
+    idle={"*": clip(lambda cue: idle_pose(cue.mood, cue.t))},
+    transitions={
+        ("*", "angry"): clip(flare_up, 1.0),
+        ("angry", "*"): clip(calm_down, 1.2),
+        ("*", "impressed"): clip(wonder, 0.9),
+        ("*", "*"): clip(blink_between, 0.3),
+    },
+    fidgets={
+        "*": [BLINK, LOOK],
+        "angry": [BLINK, HMPH],
+        "stern": [BLINK, LOOK, HMPH],
+        "suspicious": [BLINK],
+        "amused": [BLINK, LOOK, Fidget(clip(chuckle, 1.5), every=(4.0, 9.0))],
+        "thoughtful": [BLINK, Fidget(floating("hmm..", 2.0, look=2), every=(4.0, 8.0))],
+    },
+    thinking=clip(ponder),
+)
+
+GAME = Game(
+    title="The Old Wizard",
+    character="Wizard",
+    persona=PERSONA,
+    story=STORY,
+    moods=MOODS,
+    animations=ANIMATIONS,
+    ending_text="The wizard smiles as the door swings open. THE END - you learned the old magic.",
+    fallback_line="*mumbles into his beard* ...Say that again?",
+    farewell="Farewell, traveller.",
+    keep_hint="player's name, motives, promises, what the wizard revealed or taught, opinions",
+)
+
+if __name__ == "__main__":
+    main(GAME)
