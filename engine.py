@@ -330,3 +330,155 @@ def check_ollama(host: str, model: str):
                            f"Installed: {', '.join(names) or 'none'}")
 
 
+# --------------------------------------------------------------------- memory
+class Memory:
+    """Rolling notes about the conversation, compacted by a background model call when they grow."""
+
+    def __init__(self, game: Game, host: str, model: str):
+        self.game, self.host, self.model = game, host, model
+        self.notes = []
+        self.lock = threading.Lock()
+        self.compacting = False
+        self.compactions = 0
+        self.compact_failures = 0
+        self.last_compact_s = 0.0
+
+    def add(self, raw):
+        with self.lock:
+            known = {n.lower() for n in self.notes}
+            for n in split_notes(raw):
+                if n.lower() not in known:
+                    self.notes.append(n)
+                    known.add(n.lower())
+            if len(self.notes) > NOTES_LIMIT and not self.compacting:
+                self.compacting = True
+                threading.Thread(target=self._compact, args=(list(self.notes),), daemon=True).start()
+
+    def snapshot(self) -> list:
+        with self.lock:
+            return list(self.notes)
+
+    def _compact(self, old):
+        t0 = time.time()
+        prompt = (f"Below are notes about a conversation between {self.game.character} and a player. Merge "
+                  f"duplicates, drop trivia, and keep every important fact ({self.game.keep_hint}). "
+                  f"Rewrite them as at most {NOTES_TARGET} short notes, separated by commas, with no commas "
+                  f"inside a single note.\n\nNOTES:\n" + "\n".join(f"- {n}" for n in old))
+        new = []
+        try:
+            resp = chat(self.host, self.model, [{"role": "user", "content": prompt}], COMPACT_SCHEMA, 300)
+            new = split_notes(json.loads(resp.get("message", {}).get("content", "")).get("notes"))
+        except (OSError, ValueError, AttributeError):
+            pass
+        with self.lock:
+            if new and len(new) < len(old):
+                # notes added while compacting sit after the snapshot; keep them
+                self.notes = new + self.notes[len(old):]
+                self.compactions += 1
+            else:
+                self.compact_failures += 1
+            self.compacting = False
+            self.last_compact_s = time.time() - t0
+
+
+@dataclass
+class Stats:
+    turns: int = 0
+    tokens: int = 0
+    gen_ns: int = 0
+    latency: float = 0.0
+    repairs: int = 0
+    failures: int = 0
+
+    def report(self) -> str:
+        if not self.turns:
+            return "No turns yet."
+        tps = self.tokens / (self.gen_ns / 1e9) if self.gen_ns else 0
+        return (f"Turns: {self.turns} | avg {tps:.1f} tok/s | avg latency {self.latency / self.turns:.1f}s | "
+                f"invalid-JSON repairs: {self.repairs} | total failures: {self.failures}")
+
+
+# --------------------------------------------------------------------- engine
+@dataclass
+class Turn:
+    """Result of one model turn, ready for any UI to display."""
+    speak: str
+    mood: str
+    action: str
+    footer: str
+    story_idx: int  # story point this reply belongs to
+    advanced: bool = False  # this reply completed the story point
+    finished: bool = False  # ...and it was the last one
+
+
+class Engine:
+    """UI-free game session: call start(), then say() for each player message."""
+
+    def __init__(self, game: Game, host=DEFAULT_HOST, model=DEFAULT_MODEL):
+        self.game, self.host, self.model = game, host, model
+        self.schema = build_schema(game.moods)
+        self.idx = 0
+        self.history = []
+        self.memory = Memory(game, host, model)
+        self.stats = Stats()
+
+    @property
+    def story_point(self) -> StoryPoint:
+        return self.game.story[self.idx]
+
+    def start(self) -> Turn:
+        """The character speaks first."""
+        return self._turn([{"role": "user", "content": self.game.opening_nudge}])
+
+    def say(self, text: str) -> Turn:
+        """Send a player message. If the reply has advanced=True and not finished, call continue_story() next."""
+        self.history.append({"role": "user", "content": text})
+        turn = self._turn(self.history)
+        if turn.action == "advance":
+            turn.advanced = True
+            self.idx += 1
+            turn.finished = self.idx >= len(self.game.story)
+        return turn
+
+    def continue_story(self) -> Turn:
+        """The character opens the next story point (call after an advanced turn)."""
+        return self._turn(self.history + [{"role": "user", "content": self.game.next_nudge}])
+
+    def _turn(self, context) -> Turn:
+        """Ask the model (up to 2 attempts), record the reply in history and notes."""
+        idx = self.idx
+        system = build_system_prompt(self.game, idx, self.memory.snapshot())
+        messages = [{"role": "system", "content": system}] + context[-MAX_HISTORY:]
+        moods = self.game.moods
+        t0 = time.time()
+        for _ in range(2):
+            resp = chat(self.host, self.model, messages, self.schema)
+            reply, ok = parse_reply(resp.get("message", {}).get("content", ""), moods)
+            self.stats.tokens += resp.get("eval_count", 0)
+            self.stats.gen_ns += resp.get("eval_duration", 0)
+            if reply["speak"]:
+                if not ok:
+                    self.stats.repairs += 1
+                break
+            self.stats.repairs += 1
+        else:
+            self.stats.failures += 1
+            reply = {"speak": self.game.fallback_line, "mood": moods[0], "action": "stay", "notes": ""}
+        self.history.append({"role": "assistant", "content": json.dumps(reply)})
+        self.memory.add(reply["notes"])
+        elapsed = time.time() - t0
+        self.stats.turns += 1
+        self.stats.latency += elapsed
+        n, d = resp.get("eval_count", 0), resp.get("eval_duration", 0)
+        tps = n / (d / 1e9) if d else 0
+        footer = (f"[{n} tokens | {tps:.1f} tok/s | {elapsed:.1f}s | mood={reply['mood']} "
+                  f"action={reply['action']} | notes={len(self.memory.snapshot())}"
+                  f"{' (compacting)' if self.memory.compacting else ''}]")
+        return Turn(reply["speak"], reply["mood"], reply["action"], footer, idx)
+
+    def stats_report(self) -> str:
+        m = self.memory
+        return (f"{self.stats.report()}\nNotes: {len(m.snapshot())} | compactions: {m.compactions} "
+                f"(failed: {m.compact_failures}, last took {m.last_compact_s:.1f}s)")
+
+
