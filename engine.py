@@ -18,12 +18,13 @@ mood, one-shot transition Clips between moods, random Fidgets (blinks, glances) 
 the model generates. The terminal UI keeps the art moving in place while the player types (--no-anim turns it
 off).
 
-Commands in the terminal UI: /quit, /restart, /stats, /notes
+Commands in the terminal UI: /quit, /restart, /stats, /notes, /switch, /help
 """
 import argparse
 import json
 import os
 import random
+import re
 import shutil
 import sys
 import textwrap
@@ -302,24 +303,56 @@ Your goal now: {sp.goal}
 Set action to "advance" ONLY when this is true: {sp.done}
 Otherwise set action to "stay". Do not rush; never advance on the first reply of a story point unless clearly satisfied.
 {notes_block}
+The player communicates either through spoken dialogue ([Player Speech] "...") or physical actions/gestures ([Player Action] ...).
+React in character to both what the player says and what they do.
+
 You MUST reply with ONLY a JSON object, exactly in this format:
 {{"speak": "what you say", "mood": "<one of: {', '.join(game.moods)}>", "action": "<stay or advance>", \
 "notes": "<comma-separated short notes>"}}
-"notes" = important facts from the player's last message and from your own reply that you must remember later \
-(player's name, their motives, claims, promises, what you revealed or did). Short phrases separated by commas, \
-no commas inside a single note. Use "" if nothing important."""
+"notes" = important facts from this turn that you must remember later (player's name, motives, actions, claims, promises, what you revealed or did).
+EVERY note MUST explicitly begin with either "[Player]" or "[{game.character}]" to state who said or did it.
+Examples: "[Player] asked about the tower", "[Player] bowed respectfully", "[{game.character}] warned that old magic requires patience".
+Short phrases separated by commas, no commas inside a single note. Use "" if nothing important."""
 
 
-def split_notes(raw) -> list:
+def normalize_note(n: str, character: str = None) -> str:
+    """Ensure a note explicitly states whether it is about [Player] or [Character]."""
+    n = n.strip()
+    if not n:
+        return ""
+    char_label = f"[{character}]" if character else "[Character]"
+    if n.startswith("[Player]") or (character and n.startswith(char_label)):
+        return n
+    if character:
+        char_re = re.compile(rf"^(?:\[{re.escape(character)}\]\s*|(?:the\s+)?{re.escape(character)}\b\s*[:\-]?\s*)", re.IGNORECASE)
+        if char_re.match(n):
+            cleaned = char_re.sub("", n).strip()
+            return f"{char_label} {cleaned}" if cleaned else f"{char_label} (noted)"
+    player_re = re.compile(r"^(?:\[Player\]\s*|(?:the\s+)?Player\b\s*[:\-]?\s*)", re.IGNORECASE)
+    if player_re.match(n):
+        cleaned = player_re.sub("", n).strip()
+        return f"[Player] {cleaned}" if cleaned else "[Player] (noted)"
+    if re.match(r"^(?:I|my)\b", n, re.IGNORECASE):
+        return f"{char_label} {n}"
+    if re.match(r"^(?:You|your)\b", n, re.IGNORECASE):
+        return f"[Player] {n}"
+    return f"[Player] {n}"
+
+
+
+def split_notes(raw, character: str = None) -> list:
     """Turn a comma-separated string (or a list, if the model ignores the schema) into clean notes."""
     if isinstance(raw, list):
         raw = ",".join(str(x) for x in raw)
     if not isinstance(raw, str):
         return []
-    return [n.strip() for n in raw.split(",") if n.strip()]
+    notes = [n.strip() for n in raw.split(",") if n.strip()]
+    if character:
+        notes = [normalize_note(n, character) for n in notes if n]
+    return notes
 
 
-def parse_reply(raw: str, moods):
+def parse_reply(raw: str, moods, character: str = None):
     """Return (dict, ok). Always returns a usable dict; ok=False if it had to be repaired."""
     try:
         data = json.loads(raw)
@@ -328,12 +361,13 @@ def parse_reply(raw: str, moods):
     except (json.JSONDecodeError, ValueError):
         return {"speak": "", "mood": moods[0], "action": "stay", "notes": ""}, False
     ok = data.get("mood") in moods and data.get("action") in ACTIONS and "notes" in data
-    data["notes"] = ",".join(split_notes(data.get("notes")))
+    data["notes"] = ",".join(split_notes(data.get("notes"), character=character))
     if data.get("mood") not in moods:
         data["mood"] = moods[0]
     if data.get("action") not in ACTIONS:
         data["action"] = "stay"
     return data, ok
+
 
 
 def chat(host: str, model: str, messages: list, schema: dict, num_predict=400):
@@ -375,7 +409,7 @@ class Memory:
     def add(self, raw):
         with self.lock:
             known = {n.lower() for n in self.notes}
-            for n in split_notes(raw):
+            for n in split_notes(raw, character=self.game.character):
                 if n.lower() not in known:
                     self.notes.append(n)
                     known.add(n.lower())
@@ -391,12 +425,16 @@ class Memory:
         t0 = time.time()
         prompt = (f"Below are notes about a conversation between {self.game.character} and a player. Merge "
                   f"duplicates, drop trivia, and keep every important fact ({self.game.keep_hint}). "
+                  f"EVERY note must explicitly state whether it is about the player or {self.game.character} "
+                  f"using the prefix '[Player]' or '[{self.game.character}]' (e.g. '[Player] ...' or "
+                  f"'[{self.game.character}] ...'). "
                   f"Rewrite them as at most {NOTES_TARGET} short notes, separated by commas, with no commas "
                   f"inside a single note.\n\nNOTES:\n" + "\n".join(f"- {n}" for n in old))
         new = []
         try:
             resp = chat(self.host, self.model, [{"role": "user", "content": prompt}], COMPACT_SCHEMA, 300)
-            new = split_notes(json.loads(resp.get("message", {}).get("content", "")).get("notes"))
+            new = split_notes(json.loads(resp.get("message", {}).get("content", "")).get("notes"),
+                              character=self.game.character)
         except (OSError, ValueError, AttributeError):
             pass
         with self.lock:
@@ -459,9 +497,13 @@ class Engine:
         """The character speaks first."""
         return self._turn([{"role": "user", "content": self.game.opening_nudge}])
 
-    def say(self, text: str) -> Turn:
-        """Send a player message. If the reply has advanced=True and not finished, call continue_story() next."""
-        self.history.append({"role": "user", "content": text})
+    def say(self, text: str, mode: str = "say") -> Turn:
+        """Send a player message. mode can be 'say' (speech) or 'action' (physical gesture/action)."""
+        if mode == "action":
+            content = f"[Player Action] {text}"
+        else:
+            content = f'[Player Speech] "{text}"'
+        self.history.append({"role": "user", "content": content})
         turn = self._turn(self.history)
         if turn.action == "advance":
             turn.advanced = True
@@ -482,7 +524,7 @@ class Engine:
         t0 = time.time()
         for _ in range(2):
             resp = chat(self.host, self.model, messages, self.schema)
-            reply, ok = parse_reply(resp.get("message", {}).get("content", ""), moods)
+            reply, ok = parse_reply(resp.get("message", {}).get("content", ""), moods, character=self.game.character)
             self.stats.tokens += resp.get("eval_count", 0)
             self.stats.gen_ns += resp.get("eval_duration", 0)
             if reply["speak"]:
@@ -670,6 +712,7 @@ def play_terminal(game: Game, host: str, model: str, animate=True, voice=True) -
         except Exception:
             speaker = None
 
+    mode = "say"
     try:
         stage.show()
         with stage.thinking(label):
@@ -682,7 +725,7 @@ def play_terminal(game: Game, host: str, model: str, animate=True, voice=True) -
 
         while True:
             try:
-                text = stage.ask("You > ").strip()
+                text = stage.ask(f"You [{mode}] > ").strip()
             except (EOFError, KeyboardInterrupt):
                 if speaker:
                     speaker.stop()
@@ -700,12 +743,37 @@ def play_terminal(game: Game, host: str, model: str, animate=True, voice=True) -
                 stage.print(engine.stats_report())
                 continue
             if text == "/notes":
-                for n in engine.memory.snapshot():
-                    stage.print(f"  - {n}")
+                notes = engine.memory.snapshot()
+                if notes:
+                    stage.print("\n  Notes recorded so far:")
+                    for n in notes:
+                        stage.print(f"    - {n}")
+                    stage.print()
+                else:
+                    stage.print("  (No notes recorded yet)\n")
+                continue
+            if text.startswith("/switch"):
+                parts = text.split()
+                if len(parts) > 1 and parts[1].lower() in ("say", "speech", "talk"):
+                    mode = "say"
+                elif len(parts) > 1 and parts[1].lower() in ("action", "act", "do"):
+                    mode = "action"
+                else:
+                    mode = "action" if mode == "say" else "say"
+                desc = f"speak to {game.character}" if mode == "say" else "describe physical action/gesture"
+                stage.print(f"  Input mode switched to: [{mode}] ({desc})\n")
+                continue
+            if text == "/help":
+                stage.print("\n  Available commands:")
+                stage.print(f"    /switch [say|action]  Toggle or set input mode (current: [{mode}])")
+                stage.print("    /notes                Show the character's memory notes")
+                stage.print("    /stats                Show session token and timing stats")
+                stage.print("    /restart              Restart story from the beginning")
+                stage.print("    /quit                 Exit the game\n")
                 continue
 
             with stage.thinking(label):
-                turn = engine.say(text)
+                turn = engine.say(text, mode=mode)
                 if speaker:
                     speaker.prepare(turn.speak)
             if turn.advanced:
