@@ -1,6 +1,6 @@
 """The Old Wizard - game definition for engine.py.
 
-Usage: python wizard_game.py [--model gemma4:e2b] [--host http://localhost:11434] [--no-anim]
+Usage: python wizard_game.py [--model gemma4:e2b] [--host http://localhost:11434] [--no-anim] [--no-voice]
 """
 import math
 import random
@@ -343,12 +343,15 @@ GAME = Game(
     persona=PERSONA,
     story=STORY,
     moods=MOODS,
+    voice="bm_george",
+    voice_speed=0.9,
     animations=ANIMATIONS,
     ending_text="The wizard smiles as the door swings open. THE END - you learned the old magic.",
     fallback_line="*mumbles into his beard* ...Say that again?",
     farewell="Farewell, traveller.",
     keep_hint="player's name, motives, promises, what the wizard revealed or taught, opinions",
 )
+
 
 if __name__ == "__main__":
     main(GAME)
